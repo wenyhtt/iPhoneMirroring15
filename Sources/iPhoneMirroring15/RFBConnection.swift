@@ -1,9 +1,9 @@
-import AppKit
+import Foundation
 import CommonCrypto
 import Network
 
 final class RFBConnection {
-    enum Event { case connected(String?), frame(NSImage), failed(String) }
+    enum Event { case connected(String?, Int, Int), failed(String) }
     private let host: String
     private let port: UInt16
     private let password: String
@@ -16,7 +16,6 @@ final class RFBConnection {
     private var width = 0
     private var height = 0
     private var nameLength = 0
-    private var pixels = Data()
     private var closed = false
 
     init(host: String, port: UInt16, password: String, endpoint: NWEndpoint? = nil, onEvent: @escaping (Event) -> Void) {
@@ -94,15 +93,14 @@ final class RFBConnection {
                 guard nameLength <= 4096 else { fail("Invalid desktop name"); return }
                 guard bytes.count >= 24 + nameLength else { return }
                 consume(24 + nameLength)
-                pixels = Data(count: width * height * 4)
                 let format = Data([0, 0, 0, 0, 32, 24, 0, 1]) + be16(255) + be16(255) + be16(255) + Data([16, 8, 0, 0, 0, 0])
                 let encodings = Data([2, 0]) + be16(2) + be32(0) + be32(UInt32(bitPattern: -223))
-                send(format + encodings + framebufferRequest())
+                send(format + encodings)
                 stage = 5
                 let resolvedHost: String?
                 if case let .hostPort(host, _) = connection?.currentPath?.remoteEndpoint { resolvedHost = "\(host)" }
                 else { resolvedHost = nil }
-                onEvent(.connected(resolvedHost))
+                onEvent(.connected(resolvedHost, width, height))
             case 5:
                 guard bytes.count >= 1 else { return }
                 if bytes[0] == 0 {
@@ -125,8 +123,6 @@ final class RFBConnection {
             case 6:
                 if pendingRects == 0 {
                     stage = 5
-                    send(framebufferRequest())
-                    emitFrame()
                     continue
                 }
                 guard bytes.count >= 12 else { return }
@@ -136,18 +132,12 @@ final class RFBConnection {
                 if encoding == -223 {
                     consume(12); width = w; height = h
                     guard width > 0, height > 0, width <= 8192, height <= 8192, width * height <= 16_000_000 else { fail("Invalid framebuffer dimensions"); return }
-                    pixels = Data(count: width * height * 4); pendingRects -= 1
+                    pendingRects -= 1
                 } else if encoding == 0 {
                     guard w > 0, h > 0, x >= 0, y >= 0, x + w <= width, y + h <= height else { fail("Framebuffer rectangle is out of bounds"); return }
                     let length = w * h * 4
                     guard bytes.count >= 12 + length else { return }
-                    consume(12)
-                    for row in 0..<h {
-                        let source = row * w * 4
-                        let destination = ((y + row) * width + x) * 4
-                        pixels.replaceSubrange(destination..<(destination + w * 4), with: bytes[source..<(source + w * 4)])
-                    }
-                    consume(length); pendingRects -= 1
+                    consume(12 + length); pendingRects -= 1
                 } else { fail("Server selected an unsupported framebuffer encoding"); return }
             default: return
             }
@@ -156,30 +146,9 @@ final class RFBConnection {
 
     private var pendingRects = 0
     private func consume(_ count: Int) { bytes = Data(bytes.dropFirst(count)) }
-    private func framebufferRequest() -> Data { Data([3, 1]) + be16(0) + be16(0) + be16(UInt16(width)) + be16(UInt16(height)) }
     private func send(_ data: Data) { connection?.send(content: data, completion: .contentProcessed { [weak self] error in if let error { self?.fail(error.localizedDescription) } }) }
     private func fail(_ message: String) {
         guard !closed else { return }; closed = true; connection?.cancel(); onEvent(.failed(message))
-    }
-    private func emitFrame() {
-        var rgbx = Data(count: pixels.count)
-        pixels.withUnsafeBytes { source in
-            rgbx.withUnsafeMutableBytes { destination in
-                guard let src = source.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                      let dst = destination.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
-                for offset in stride(from: 0, to: pixels.count, by: 4) {
-                    dst[offset] = src[offset + 2]
-                    dst[offset + 1] = src[offset + 1]
-                    dst[offset + 2] = src[offset]
-                    dst[offset + 3] = 255
-                }
-            }
-        }
-        guard let provider = CGDataProvider(data: rgbx as CFData), let color = CGColorSpace(name: CGColorSpace.sRGB),
-              let cgImage = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4,
-                                    space: color, bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue),
-                                    provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent) else { return }
-        onEvent(.frame(NSImage(cgImage: cgImage, size: NSSize(width: width, height: height))))
     }
 }
 

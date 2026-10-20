@@ -17,10 +17,15 @@ struct ContentView: View {
                 ZStack {
                     if showingConnection {
                         connectionView
-                    } else if model.connected, let image = model.image {
-                        RemoteScreen(image: image) { x, y, buttons in
-                            model.pointer(x: x, y: y, buttons: buttons)
-                        }
+                    } else if let image = model.image {
+                        RemoteScreen(
+                            image: image,
+                            screenWidth: model.framebufferWidth,
+                            screenHeight: model.framebufferHeight,
+                            onPointer: model.connected ? { x, y, buttons in
+                                model.pointer(x: x, y: y, buttons: buttons)
+                            } : nil
+                        )
                         .frame(width: screenSize.width, height: screenSize.height)
                     } else {
                         phoneStatus
@@ -45,6 +50,9 @@ struct ContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .connectRequested)) { _ in
             showingConnection = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+            model.shutdown()
         }
     }
 
@@ -124,20 +132,16 @@ struct ContentView: View {
     }
 
     private var phoneStatus: some View {
-        let connecting = model.busy || (model.connected && model.image == nil)
+        let connecting = model.busy
         return VStack(spacing: 18) {
             Spacer()
             Image(systemName: "iphone.gen3")
                 .font(.system(size: 42, weight: .regular))
                 .foregroundStyle(Color(white: 0.68))
-            Text(
-                connecting
-                    ? "Connecting…"
-                    : (model.connectionError == nil ? "No iPhone Connected" : "Could Not Connect")
-            )
+            Text(connecting ? "Connecting…" : (model.airPlayError == nil ? "Waiting for iPhone" : "AirPlay Unavailable"))
             .font(.system(size: 20, weight: .bold))
             .foregroundStyle(Color(white: 0.28))
-            Text(model.connectionError ?? "Connect to a iPhone device to begin.")
+            Text(model.airPlayError ?? "Choose iPhone Mirroring 15 in Control Center to begin. Connect to TrollVNC to control the screen.")
                 .font(.system(size: 14))
                 .foregroundStyle(Color(white: 0.32))
                 .multilineTextAlignment(.center)
@@ -237,10 +241,14 @@ struct ContentView: View {
 
 private struct RemoteScreen: NSViewRepresentable {
     let image: NSImage
-    let onPointer: (Int, Int, UInt8) -> Void
+    let screenWidth: Int
+    let screenHeight: Int
+    let onPointer: ((Int, Int, UInt8) -> Void)?
     func makeNSView(context: Context) -> ScreenView { ScreenView() }
     func updateNSView(_ view: ScreenView, context: Context) {
         view.image = image
+        view.screenWidth = screenWidth
+        view.screenHeight = screenHeight
         view.onPointer = onPointer
     }
 }
@@ -319,6 +327,8 @@ private struct WindowDragHandle: NSViewRepresentable {
 
 private final class ScreenView: NSView {
     var image: NSImage? { didSet { needsDisplay = true } }
+    var screenWidth = 0
+    var screenHeight = 0
     var onPointer: ((Int, Int, UInt8) -> Void)?
     private var buttons: UInt8 = 0
     override var isFlipped: Bool { true }
@@ -355,6 +365,8 @@ private final class ScreenView: NSView {
         let originY = (bounds.height - image.size.height * scale) / 2
         let x = min(max(Int((point.x - originX) / scale), 0), Int(image.size.width) - 1)
         let y = min(max(Int((point.y - originY) / scale), 0), Int(image.size.height) - 1)
-        onPointer?(x, y, buttons)
+        let targetWidth = screenWidth > 0 ? screenWidth : Int(image.size.width)
+        let targetHeight = screenHeight > 0 ? screenHeight : Int(image.size.height)
+        onPointer?(x * targetWidth / Int(image.size.width), y * targetHeight / Int(image.size.height), buttons)
     }
 }

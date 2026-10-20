@@ -20,15 +20,22 @@ final class AppModel: ObservableObject {
     @Published var status = "Find a device or enter its address"
     @Published var connectionError: String?
     @Published var image: NSImage?
+    @Published var framebufferWidth = 0
+    @Published var framebufferHeight = 0
     @Published var connected = false
     @Published var busy = false
+    @Published var airPlayError: String?
 
     private var browser: NWBrowser?
     private var connection: RFBConnection?
     private var serviceEndpoints: [String: NWEndpoint] = [:]
+    private var videoReceiver: AirPlayVideoStream?
+    private var uxplayProcess: Process?
+    private var isShuttingDown = false
 
     init() {
         devices = (try? JSONDecoder().decode([SavedDevice].self, from: UserDefaults.standard.data(forKey: "devices") ?? Data())) ?? []
+        startAirPlay()
         discover()
         if let lastID = UserDefaults.standard.string(forKey: "lastConnectedDevice"),
            let device = devices.first(where: { $0.id == lastID }) ?? devices.first {
@@ -65,16 +72,17 @@ final class AppModel: ObservableObject {
         selected = target
         busy = true
         connectionError = nil
-        image = nil
         status = "Connecting to \(target.name)…"
         let endpoint = serviceEndpoints[target.id]
         connection = RFBConnection(host: target.host, port: target.port, password: password, endpoint: endpoint) { [weak self] event in
             DispatchQueue.main.async {
                 guard let self else { return }
                 switch event {
-                case .connected(let resolvedHost):
+                case .connected(let resolvedHost, let width, let height):
                     self.busy = false
                     self.connected = true
+                    self.framebufferWidth = width
+                    self.framebufferHeight = height
                     if let resolvedHost, endpoint != nil {
                         target.host = resolvedHost
                         self.selected = target
@@ -89,7 +97,6 @@ final class AppModel: ObservableObject {
                         self.devices.insert(target, at: 0)
                         UserDefaults.standard.set(try? JSONEncoder().encode(self.devices), forKey: "devices")
                     }
-                case .frame(let image): self.image = image
                 case .failed(let message):
                     self.busy = false
                     self.connected = false
@@ -106,8 +113,18 @@ final class AppModel: ObservableObject {
         connection = nil
         connected = false
         busy = false
-        image = nil
         status = "Disconnected"
+    }
+
+    func shutdown() {
+        guard !isShuttingDown else { return }
+        isShuttingDown = true
+        connection?.disconnect()
+        connection = nil
+        videoReceiver?.stop()
+        videoReceiver = nil
+        if let uxplayProcess, uxplayProcess.isRunning { uxplayProcess.terminate() }
+        uxplayProcess = nil
     }
 
     func pointer(x: Int, y: Int, buttons: UInt8) { connection?.pointer(x: x, y: y, buttons: buttons) }
@@ -121,6 +138,52 @@ final class AppModel: ObservableObject {
         var item = query
         item[kSecValueData as String] = data
         SecItemAdd(item as CFDictionary, nil)
+    }
+
+    private func startAirPlay() {
+        let receiver = AirPlayVideoStream(onFrame: { [weak self] image in
+            self?.image = image
+        }, onError: { [weak self] message in
+            self?.airPlayError = message
+        })
+        do {
+            let port = try receiver.start()
+            videoReceiver = receiver
+
+            let executable: URL
+            if let override = ProcessInfo.processInfo.environment["UXPLAY_PATH"], !override.isEmpty {
+                executable = URL(fileURLWithPath: override)
+            } else {
+                executable = Bundle.main.bundleURL
+                    .deletingLastPathComponent()
+                    .deletingLastPathComponent()
+                    .appendingPathComponent("../UxPlay/build/uxplay")
+                    .standardizedFileURL
+            }
+            guard FileManager.default.isExecutableFile(atPath: executable.path) else {
+                airPlayError = "UxPlay not found at \(executable.path). Set UXPLAY_PATH to its executable."
+                return
+            }
+
+            let process = Process()
+            process.executableURL = executable
+            process.arguments = ["-n", "iPhone Mirroring 15", "-vrtp", "config-interval=1 ! udpsink host=127.0.0.1 port=\(port)"]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            process.terminationHandler = { [weak self] process in
+                guard process.terminationStatus != 0 else { return }
+                DispatchQueue.main.async {
+                    self?.airPlayError = "UxPlay exited with status \(process.terminationStatus)"
+                }
+            }
+            try process.run()
+            uxplayProcess = process
+            airPlayError = nil
+        } catch {
+            receiver.stop()
+            videoReceiver = nil
+            airPlayError = error.localizedDescription
+        }
     }
 
     func select(_ device: SavedDevice) {
