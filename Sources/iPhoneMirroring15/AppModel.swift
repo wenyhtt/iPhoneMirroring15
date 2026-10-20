@@ -1,0 +1,140 @@
+import AppKit
+import Combine
+import Network
+import Security
+
+struct SavedDevice: Codable, Identifiable, Hashable {
+    var id: String { "\(host):\(port)" }
+    var name: String
+    var host: String
+    var port: UInt16
+}
+
+final class AppModel: ObservableObject {
+    @Published var devices: [SavedDevice] = []
+    @Published var discovered: [SavedDevice] = []
+    @Published var selected: SavedDevice?
+    @Published var host = ""
+    @Published var port = "5901"
+    @Published var password = ""
+    @Published var status = "Find a device or enter its address"
+    @Published var connectionError: String?
+    @Published var image: NSImage?
+    @Published var connected = false
+    @Published var busy = false
+
+    private var browser: NWBrowser?
+    private var connection: RFBConnection?
+    private var serviceEndpoints: [String: NWEndpoint] = [:]
+
+    init() {
+        devices = (try? JSONDecoder().decode([SavedDevice].self, from: UserDefaults.standard.data(forKey: "devices") ?? Data())) ?? []
+        discover()
+        if let lastID = UserDefaults.standard.string(forKey: "lastConnectedDevice"),
+           let device = devices.first(where: { $0.id == lastID }) ?? devices.first {
+            select(device)
+            connect(device)
+        }
+    }
+
+    func discover() {
+        browser?.cancel()
+        let browser = NWBrowser(for: .bonjour(type: "_rfb._tcp", domain: nil), using: .tcp)
+        browser.browseResultsChangedHandler = { [weak self] results, _ in
+            let found = results.compactMap { result -> (SavedDevice, NWEndpoint)? in
+                guard case let .service(name, _, domain, _) = result.endpoint else { return nil }
+                return (SavedDevice(name: name, host: "\(name).\(domain)", port: 5901), result.endpoint)
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.discovered = found.map(\.0)
+                self.serviceEndpoints = Dictionary(found.map { ($0.0.id, $0.1) }, uniquingKeysWith: { first, _ in first })
+            }
+        }
+        browser.stateUpdateHandler = { [weak self] state in
+            if case .failed(let error) = state { DispatchQueue.main.async { self?.status = "Discovery failed: \(error.localizedDescription)" } }
+        }
+        self.browser = browser
+        browser.start(queue: .main)
+    }
+
+    func connect(_ device: SavedDevice? = nil) {
+        var target = device ?? SavedDevice(name: host, host: host.trimmingCharacters(in: .whitespacesAndNewlines), port: UInt16(port) ?? 0)
+        guard !target.host.isEmpty, target.port > 0 else { status = "Enter a valid host and port"; return }
+        connection?.disconnect()
+        selected = target
+        busy = true
+        connectionError = nil
+        image = nil
+        status = "Connecting to \(target.name)…"
+        let endpoint = serviceEndpoints[target.id]
+        connection = RFBConnection(host: target.host, port: target.port, password: password, endpoint: endpoint) { [weak self] event in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch event {
+                case .connected(let resolvedHost):
+                    self.busy = false
+                    self.connected = true
+                    if let resolvedHost, endpoint != nil {
+                        target.host = resolvedHost
+                        self.selected = target
+                        if let index = self.devices.firstIndex(where: { $0.name == target.name }) { self.devices[index] = target }
+                        else { self.devices.insert(target, at: 0) }
+                        UserDefaults.standard.set(try? JSONEncoder().encode(self.devices), forKey: "devices")
+                    }
+                    if !self.password.isEmpty { self.storePassword(for: target) }
+                    UserDefaults.standard.set(target.id, forKey: "lastConnectedDevice")
+                    self.status = "Connected to \(target.name)"
+                    if endpoint == nil && !self.devices.contains(where: { $0.id == target.id }) {
+                        self.devices.insert(target, at: 0)
+                        UserDefaults.standard.set(try? JSONEncoder().encode(self.devices), forKey: "devices")
+                    }
+                case .frame(let image): self.image = image
+                case .failed(let message):
+                    self.busy = false
+                    self.connected = false
+                    self.connectionError = message
+                    self.status = message
+                }
+            }
+        }
+        connection?.connect()
+    }
+
+    func disconnect() {
+        connection?.disconnect()
+        connection = nil
+        connected = false
+        busy = false
+        image = nil
+        status = "Disconnected"
+    }
+
+    func pointer(x: Int, y: Int, buttons: UInt8) { connection?.pointer(x: x, y: y, buttons: buttons) }
+    func home() { connection?.pointer(x: 0, y: 0, buttons: 4); connection?.pointer(x: 0, y: 0, buttons: 0) }
+    func power() { connection?.pointer(x: 0, y: 0, buttons: 2); connection?.pointer(x: 0, y: 0, buttons: 0) }
+
+    private func storePassword(for device: SavedDevice) {
+        let data = Data(password.utf8)
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "iPhoneMirroring15", kSecAttrAccount as String: "\(device.name):\(device.port)"]
+        SecItemDelete(query as CFDictionary)
+        var item = query
+        item[kSecValueData as String] = data
+        SecItemAdd(item as CFDictionary, nil)
+    }
+
+    func select(_ device: SavedDevice) {
+        selected = device
+        host = device.host
+        port = String(device.port)
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "iPhoneMirroring15", kSecAttrAccount as String: "\(device.name):\(device.port)", kSecReturnData as String: true]
+        var result: CFTypeRef?
+        SecItemCopyMatching(query as CFDictionary, &result)
+        password = (result as? Data).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+    }
+
+    func deleteDevices(at offsets: IndexSet) {
+        devices.remove(atOffsets: offsets)
+        UserDefaults.standard.set(try? JSONEncoder().encode(devices), forKey: "devices")
+    }
+}
