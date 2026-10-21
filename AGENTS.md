@@ -5,12 +5,12 @@ This repository contains a native macOS SwiftUI viewer for TrollVNC, including d
 ## Project Structure
 
 - `Sources/iPhoneMirroring15/` holds the Swift application: `main.swift` configures the app and window, `ContentView.swift` contains the interface and screen input, `AppModel.swift` manages connection state and discovery, and `RFBConnection.swift` implements the VNC protocol.
-- `Info.plist` contains app metadata and permissions. `Makefile` builds the app. `README.md` documents usage and compatibility.
+- `Scripts/bundle_runtime.py` embeds UxPlay and its GStreamer runtime dependencies. `Info.plist` contains app metadata and permissions. `Makefile` builds the app. `README.md` documents usage and compatibility.
 - There is currently no test target or separate assets directory. Build products in `.build/` and `build/` are ignored.
 
 ## Build and Run
 
-Requires macOS 14 or newer and Xcode Command Line Tools.
+Requires macOS, Xcode Command Line Tools, GStreamer development packages, and a built UxPlay checkout at `../UxPlay`. The app’s minimum macOS version follows the GStreamer runtime used for the build.
 
 ```sh
 make app

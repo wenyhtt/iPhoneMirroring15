@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import Darwin
 import Network
 import Security
 
@@ -31,9 +32,12 @@ final class AppModel: ObservableObject {
     private var serviceEndpoints: [String: NWEndpoint] = [:]
     private var videoReceiver: AirPlayVideoStream?
     private var uxplayProcess: Process?
+    private var uxplayErrorOutput = ""
+    private let uxplayErrorLock = NSLock()
     private var isShuttingDown = false
 
     init() {
+        configureBundledGStreamer()
         devices = (try? JSONDecoder().decode([SavedDevice].self, from: UserDefaults.standard.data(forKey: "devices") ?? Data())) ?? []
         startAirPlay()
         discover()
@@ -154,11 +158,17 @@ final class AppModel: ObservableObject {
             if let override = ProcessInfo.processInfo.environment["UXPLAY_PATH"], !override.isEmpty {
                 executable = URL(fileURLWithPath: override)
             } else {
-                executable = Bundle.main.bundleURL
-                    .deletingLastPathComponent()
-                    .deletingLastPathComponent()
-                    .appendingPathComponent("../UxPlay/build/uxplay")
-                    .standardizedFileURL
+                let bundledExecutable = Bundle.main.bundleURL
+                    .appendingPathComponent("Contents/Helpers/uxplay")
+                if FileManager.default.isExecutableFile(atPath: bundledExecutable.path) {
+                    executable = bundledExecutable
+                } else {
+                    executable = Bundle.main.bundleURL
+                        .deletingLastPathComponent()
+                        .deletingLastPathComponent()
+                        .appendingPathComponent("../UxPlay/build/uxplay")
+                        .standardizedFileURL
+                }
             }
             guard FileManager.default.isExecutableFile(atPath: executable.path) else {
                 airPlayError = "UxPlay not found at \(executable.path). Set UXPLAY_PATH to its executable."
@@ -169,11 +179,33 @@ final class AppModel: ObservableObject {
             process.executableURL = executable
             process.arguments = ["-n", "iPhone Mirroring 15", "-vrtp", "config-interval=1 ! udpsink host=127.0.0.1 port=\(port)"]
             process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
+            let errorPipe = Pipe()
+            process.standardError = errorPipe
+            uxplayErrorOutput = ""
+            errorPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+                let data = handle.availableData
+                guard !data.isEmpty, let self else {
+                    handle.readabilityHandler = nil
+                    return
+                }
+                let output = String(decoding: data, as: UTF8.self)
+                self.uxplayErrorLock.lock()
+                self.uxplayErrorOutput = String((self.uxplayErrorOutput + output).suffix(600))
+                self.uxplayErrorLock.unlock()
+            }
             process.terminationHandler = { [weak self] process in
-                guard process.terminationStatus != 0 else { return }
+                errorPipe.fileHandleForReading.readabilityHandler = nil
                 DispatchQueue.main.async {
-                    self?.airPlayError = "UxPlay exited with status \(process.terminationStatus)"
+                    guard let self, !self.isShuttingDown, process.terminationStatus != 0 else { return }
+                    self.uxplayErrorLock.lock()
+                    let details = self.uxplayErrorOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+                    self.uxplayErrorLock.unlock()
+                    let termination = process.terminationReason == .uncaughtSignal
+                        ? "signal \(process.terminationStatus)"
+                        : "exit status \(process.terminationStatus)"
+                    self.airPlayError = details.isEmpty
+                        ? "UxPlay stopped with \(termination)"
+                        : "UxPlay stopped with \(termination):\n\(details)"
                 }
             }
             try process.run()
@@ -184,6 +216,21 @@ final class AppModel: ObservableObject {
             videoReceiver = nil
             airPlayError = error.localizedDescription
         }
+    }
+
+    private func configureBundledGStreamer() {
+        let contents = Bundle.main.bundleURL.appendingPathComponent("Contents")
+        let plugins = contents.appendingPathComponent("PlugIns/GStreamer")
+        let scanner = contents.appendingPathComponent("Helpers/gst-plugin-scanner")
+        guard FileManager.default.fileExists(atPath: plugins.path),
+              FileManager.default.isExecutableFile(atPath: scanner.path) else { return }
+
+        setenv("GST_PLUGIN_SYSTEM_PATH_1_0", plugins.path, 1)
+        setenv("GST_PLUGIN_SYSTEM_PATH", plugins.path, 1)
+        setenv("GST_PLUGIN_SCANNER_1_0", scanner.path, 1)
+        setenv("GST_PLUGIN_SCANNER", scanner.path, 1)
+        unsetenv("GST_PLUGIN_PATH_1_0")
+        unsetenv("GST_PLUGIN_PATH")
     }
 
     func select(_ device: SavedDevice) {
